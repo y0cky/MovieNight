@@ -8,7 +8,7 @@ import asyncio
 DISCORD_TOKEN = ''
 TMDB_API_KEY = ''
 TRAKT_CLIENT_ID = ''
-DATABASE_FILE = 'movie_night.db'
+DATABASE_FILE = 'movie_night_final.db'
 
 # --- DATABASE SETUP ---
 def init_db():
@@ -104,26 +104,46 @@ def check_trakt_history(tmdb_id):
                 
     return already_watched
 
-async def get_ranking_embed():
+async def get_ranking_embed(user_ids=None):
+    """Generates the ranking embed. Optional: filter by a list of discord user_ids."""
     conn = sqlite3.connect(DATABASE_FILE)
     c = conn.cursor()
-    c.execute('''SELECT m.title, SUM(v.score) as total, MIN(v.score) as min_s, COUNT(v.user_id) 
-                 FROM movies m JOIN votes v ON m.tmdb_id = v.tmdb_id 
-                 GROUP BY m.tmdb_id''')
+    
+    if user_ids:
+        # Erstellt eine Liste von Platzhaltern (?,?,?) für die SQL-Abfrage
+        placeholders = ', '.join(['?'] * len(user_ids))
+        query = f'''SELECT m.title, SUM(v.score) as total, MIN(v.score) as min_s, COUNT(v.user_id) 
+                    FROM movies m JOIN votes v ON m.tmdb_id = v.tmdb_id 
+                    WHERE v.user_id IN ({placeholders})
+                    GROUP BY m.tmdb_id'''
+        c.execute(query, user_ids)
+    else:
+        query = '''SELECT m.title, SUM(v.score) as total, MIN(v.score) as min_s, COUNT(v.user_id) 
+                    FROM movies m JOIN votes v ON m.tmdb_id = v.tmdb_id 
+                    GROUP BY m.tmdb_id'''
+        c.execute(query)
+        
     results = c.fetchall()
     conn.close()
 
     if not results:
-        return discord.Embed(description="No movies voted on yet!", color=discord.Color.orange())
+        return discord.Embed(description="No votes found for the selected users!", color=discord.Color.orange())
 
     valid = sorted([r for r in results if r[2] > -50], key=lambda x: x[1], reverse=True)
     vetos = [r for r in results if r[2] <= -50]
 
-    embed = discord.Embed(title="📊 Current Standings", color=discord.Color.gold())
+    title_text = "📊 Filtered Standings" if user_ids else "📊 Current Standings"
+    embed = discord.Embed(title=title_text, color=discord.Color.gold())
+    
     ranking_text = "\n".join([f"{i+1}. **{r[0]}** — `{r[1]} pts` ({r[3]} votes)" for i, r in enumerate(valid)])
     embed.description = ranking_text if ranking_text else "No movies in ranking."
+    
     if vetos:
         embed.add_field(name="🚫 Vetoed", value=", ".join([f"~~{v[0]}~~" for v in vetos]), inline=False)
+    
+    if user_ids:
+        embed.set_footer(text=f"Filtered for {len(user_ids)} specific user(s)")
+        
     return embed
 
 # --- UI COMPONENTS ---
@@ -137,6 +157,8 @@ class MovieVoteView(discord.ui.View):
             self.add_item(discord.ui.Button(label="Trailer 🍿", url=trailer_url, style=discord.ButtonStyle.link, row=2))
 
     async def cast_vote(self, interaction, score):
+        ranking_embed = await get_ranking_embed() # Zeigt weiterhin das globale Ranking
+        await interaction.channel.send(embed=ranking_embed, delete_after=20)
         conn = sqlite3.connect(DATABASE_FILE)
         c = conn.cursor()
         c.execute("INSERT OR REPLACE INTO votes (tmdb_id, user_id, score) VALUES (?, ?, ?)",
@@ -200,9 +222,17 @@ async def movie(ctx, *, query: str):
 
 @bot.command()
 async def ranking(ctx):
-    """Shows current standings"""
-    await ctx.send(embed=await get_ranking_embed())
-
+    """Shows current standings. Usage: !ranking or !ranking @user1 @user2"""
+    # Prüfe, ob User im Befehl erwähnt wurden
+    if ctx.message.mentions:
+        # Erstelle eine Liste der Discord IDs der erwähnten User
+        user_ids = [user.id for user in ctx.message.mentions]
+        embed = await get_ranking_embed(user_ids=user_ids)
+    else:
+        # Standard: Ranking für alle
+        embed = await get_ranking_embed()
+        
+    await ctx.send(embed=embed)
 @bot.command()
 async def set_trakt(ctx, username: str):
     """Link your Discord ID to your Public Trakt.tv username"""
