@@ -10,7 +10,7 @@ import random
 DISCORD_TOKEN = ''
 TMDB_API_KEY = ''
 TRAKT_CLIENT_ID = ''
-DATABASE_FILE = 'movie_night_final.db'
+DATABASE_FILE = 'movie_night.db'
 JELLYSEERR_BASE_URL = None 
 
 # --- DATABASE SETUP ---
@@ -58,11 +58,14 @@ def check_trakt_data(tmdb_id):
     headers = {"Content-Type": "application/json", "trakt-api-version": "2", "trakt-api-key": TRAKT_CLIENT_ID}
     for (username,) in users:
         try:
-            r_coll = requests.get(f"https://api.trakt.tv/users/{username}/collection/movies", headers=headers)
+            # Collection Check
+            r_coll = requests.get(f"https://api.trakt.tv/users/{username}/collection/movies", headers=headers, timeout=10)
             if r_coll.status_code == 200:
                 if any(str(e.get('movie', {}).get('ids', {}).get('tmdb', '')) == str(tmdb_id) for e in r_coll.json()):
                     reports.append(f"📦 **{username}** has this in their **Collection**")
-            r_hist = requests.get(f"https://api.trakt.tv/users/{username}/history/movies?limit=50", headers=headers)
+            
+            # History Check (High limit for deep search)
+            r_hist = requests.get(f"https://api.trakt.tv/users/{username}/history/movies?limit=5000", headers=headers, timeout=15)
             if r_hist.status_code == 200:
                 for entry in r_hist.json():
                     if str(entry.get('movie', {}).get('ids', {}).get('tmdb', '')) == str(tmdb_id):
@@ -90,12 +93,17 @@ async def get_ranking_embed(user_ids=None):
 # --- UI COMPONENTS ---
 
 class MovieVoteView(discord.ui.View):
-    def __init__(self, tmdb_id, title, trailer_url=None):
+    def __init__(self, tmdb_id, title, imdb_id=None, trailer_url=None):
         super().__init__(timeout=None)
         self.tmdb_id, self.title = tmdb_id, title
+        
         if trailer_url: self.add_item(discord.ui.Button(label="Trailer 🍿", url=trailer_url, row=2))
-        if JELLYSEERR_BASE_URL:
-            self.add_item(discord.ui.Button(label="Jellyseerr 📥", url=f"{JELLYSEERR_BASE_URL.rstrip('/')}/movie/{tmdb_id}", row=2))
+        self.add_item(discord.ui.Button(label="TMDB 🎬", url=f"https://www.themoviedb.org/movie/{tmdb_id}", row=2))
+        if imdb_id: self.add_item(discord.ui.Button(label="IMDb 🎥", url=f"https://www.imdb.com/title/{imdb_id}", row=2))
+        self.add_item(discord.ui.Button(label="Letterboxd 💚", url=f"https://letterboxd.com/tmdb/{tmdb_id}", row=3))
+        search_title = title.replace(" ", "+")
+        self.add_item(discord.ui.Button(label="JustWatch 📺", url=f"https://www.justwatch.com/de/Suche?q={search_title}", row=3))
+        if JELLYSEERR_BASE_URL: self.add_item(discord.ui.Button(label="Jellyseerr 📥", url=f"{JELLYSEERR_BASE_URL.rstrip('/')}/movie/{tmdb_id}", row=3))
 
     async def cast_vote(self, interaction, score):
         conn = sqlite3.connect(DATABASE_FILE); c = conn.cursor()
@@ -127,20 +135,28 @@ class VoteDropdown(discord.ui.Select):
         super().__init__(placeholder="Select a movie to open the voting card...", options=options)
 
     async def callback(self, interaction: discord.Interaction):
+        # STABILITY FIX: Tell Discord we are working
+        await interaction.response.defer()
+        
         tmdb_id = self.values[0]
         data = search_tmdb_by_id(tmdb_id)
-        if not data: return await interaction.response.send_message("Failed to fetch movie data.", ephemeral=True)
+        if not data: return await interaction.followup.send("Failed to fetch movie data.", ephemeral=True)
         
         title, year = data['title'], data.get('release_date', '????')[:4]
         poster = f"https://image.tmdb.org/t/p/w500{data.get('poster_path', '')}" if data.get('poster_path') else None
+        rating = data.get('vote_average', '0')
         
-        embed = discord.Embed(title=f"{title} ({year})", description=data.get('overview', '')[:450]+"...", color=0x2b2d31)
+        tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}"
+        embed = discord.Embed(title=f"{title} ({year})", url=tmdb_url, description=data.get('overview', '')[:450]+"...", color=0x2b2d31)
         if poster: embed.set_image(url=poster)
+        embed.add_field(name="TMDB Rating", value=f"⭐ **{rating}/10**", inline=True)
         
+        # This can take 5-10 seconds with high limits
         trakt_info = check_trakt_data(tmdb_id)
         if trakt_info: embed.add_field(name="🛰️ Trakt Intelligence", value="\n".join(trakt_info), inline=False)
         
-        await interaction.response.send_message(embed=embed, view=MovieVoteView(tmdb_id, title, get_tmdb_trailer(tmdb_id)))
+        # Use followup because of defer()
+        await interaction.followup.send(embed=embed, view=MovieVoteView(tmdb_id, title, data.get('imdb_id'), get_tmdb_trailer(tmdb_id)))
 
 class VoteView(discord.ui.View):
     def __init__(self, movies):
@@ -159,40 +175,43 @@ bot = MovieBot()
 
 # --- SLASH COMMANDS ---
 
-@bot.tree.command(name="movie", description="Search and add a movie to the candidate list")
+@bot.tree.command(name="movie", description="Search and add a movie to the list")
 async def movie(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
     data = search_tmdb_by_id(query) if query.isdigit() else None
-    if not data: return await interaction.followup.send("Movie not found. Please select from the dropdown suggestions!")
+    if not data: return await interaction.followup.send("Movie not found. Use the dropdown!")
     
     tmdb_id, title, year = str(data['id']), data['title'], data.get('release_date', '????')[:4]
     poster = f"https://image.tmdb.org/t/p/w500{data.get('poster_path', '')}" if data.get('poster_path') else None
+    rating = data.get('vote_average', '0')
     
     conn = sqlite3.connect(DATABASE_FILE); c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO movies VALUES (?, ?, ?, ?)", (tmdb_id, title, poster, year))
     conn.commit(); conn.close()
 
-    embed = discord.Embed(title=f"{title} ({year})", description=data.get('overview', '')[:450]+"...", color=0x2b2d31)
+    tmdb_url = f"https://www.themoviedb.org/movie/{tmdb_id}"
+    embed = discord.Embed(title=f"{title} ({year})", url=tmdb_url, description=data.get('overview', '')[:450]+"...", color=0x2b2d31)
     if poster: embed.set_image(url=poster)
+    embed.add_field(name="TMDB Rating", value=f"⭐ **{rating}/10**", inline=True)
     
     trakt_info = check_trakt_data(tmdb_id)
     if trakt_info: embed.add_field(name="🛰️ Trakt Intelligence", value="\n".join(trakt_info), inline=False)
     
-    await interaction.followup.send(embed=embed, view=MovieVoteView(tmdb_id, title, get_tmdb_trailer(tmdb_id)))
+    await interaction.followup.send(embed=embed, view=MovieVoteView(tmdb_id, title, data.get('imdb_id'), get_tmdb_trailer(tmdb_id)))
 
 @movie.autocomplete('query')
 async def movie_autocomplete(interaction, current: str):
     return get_tmdb_suggestions(current)
 
-@bot.tree.command(name="vote", description="List all candidate movies and open a voting card")
+@bot.tree.command(name="vote", description="Vote for a movie from the candidate list")
 async def vote_list(interaction: discord.Interaction):
     conn = sqlite3.connect(DATABASE_FILE); c = conn.cursor()
     c.execute("SELECT tmdb_id, title, year FROM movies")
     movies = c.fetchall(); conn.close()
-    if not movies: return await interaction.response.send_message("No movies added yet! Use `/movie` to add one.", ephemeral=True)
-    await interaction.response.send_message("Select a movie to cast your vote:", view=VoteView(movies), ephemeral=True)
+    if not movies: return await interaction.response.send_message("No movies found! Use `/movie` first.", ephemeral=True)
+    await interaction.response.send_message("Select a movie:", view=VoteView(movies), ephemeral=True)
 
-@bot.tree.command(name="ranking", description="Show the current movie leaderboard")
+@bot.tree.command(name="ranking", description="Show movie ranking")
 async def ranking(interaction: discord.Interaction, user1: discord.Member = None, user2: discord.Member = None):
     selected = [u.id for u in [user1, user2] if u]
     await interaction.response.send_message(embed=await get_ranking_embed(selected if selected else None))
@@ -206,47 +225,40 @@ async def watched(interaction: discord.Interaction, movie_title: str):
         c.execute("DELETE FROM votes WHERE tmdb_id = ?", (res[0],))
         c.execute("DELETE FROM movies WHERE tmdb_id = ?", (res[0],))
         conn.commit(); conn.close()
-        await interaction.response.send_message(f"✅ **{movie_title}** has been removed.")
+        await interaction.response.send_message(f"✅ **{movie_title}** removed.")
     else:
-        conn.close()
-        await interaction.response.send_message("Movie not found in the local list.", ephemeral=True)
+        conn.close(); await interaction.response.send_message("Movie not found.", ephemeral=True)
 
-@watched.autocomplete('movie_title')
-async def watched_auto(interaction, current: str):
-    conn = sqlite3.connect(DATABASE_FILE); c = conn.cursor()
-    c.execute("SELECT title FROM movies WHERE title LIKE ?", (f'%{current}%',))
-    return [app_commands.Choice(name=t[0], value=t[0]) for t in c.fetchall()[:25]]
-
-@bot.tree.command(name="set_trakt", description="Connect your Trakt account to check history/collection")
+@bot.tree.command(name="set_trakt", description="Link your Trakt account")
 async def set_trakt(interaction: discord.Interaction, username: str):
     conn = sqlite3.connect(DATABASE_FILE); c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO users (discord_id, trakt_username) VALUES (?, ?)", (interaction.user.id, username))
     conn.commit(); conn.close()
-    await interaction.response.send_message(f"✅ Successfully linked to Trakt user: **{username}**", ephemeral=True)
+    await interaction.response.send_message(f"✅ Linked to: **{username}**", ephemeral=True)
 
-@bot.tree.command(name="pick", description="Fate chooses a winner from the Top 3 candidates")
+@bot.tree.command(name="pick", description="Pick a random winner from the Top 3")
 async def pick(interaction: discord.Interaction):
     conn = sqlite3.connect(DATABASE_FILE); c = conn.cursor()
     c.execute('SELECT m.title, SUM(v.score), MIN(v.score) FROM movies m JOIN votes v ON m.tmdb_id = v.tmdb_id GROUP BY m.tmdb_id HAVING MIN(v.score) > -50 ORDER BY SUM(v.score) DESC')
     results = c.fetchall(); conn.close()
-    if not results: return await interaction.response.send_message("No eligible movies found!")
+    if not results: return await interaction.response.send_message("No movies!")
     winner = random.choice(results[:3])
-    await interaction.response.send_message("🥁 Rolling the dice...")
+    await interaction.response.send_message("🥁 Rolling...")
     await asyncio.sleep(2)
-    await interaction.edit_original_response(content=None, embed=discord.Embed(title="🎲 Fate has decided!", description=f"# 🏆 {winner[0]}", color=discord.Color.purple()))
+    await interaction.edit_original_response(content=None, embed=discord.Embed(title="🎲 Winner", description=f"# 🏆 {winner[0]}", color=discord.Color.purple()))
 
-@bot.tree.command(name="clear", description="Reset all movies and votes for a fresh session (Admins only)")
+@bot.tree.command(name="clear", description="Reset database (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def clear(interaction: discord.Interaction):
     conn = sqlite3.connect(DATABASE_FILE); c = conn.cursor()
     c.execute("DELETE FROM votes"); c.execute("DELETE FROM movies")
     conn.commit(); conn.close()
-    await interaction.response.send_message(embed=discord.Embed(title="🧹 Session Reset", description="Database wiped. Ready for new movies!", color=discord.Color.red()))
+    await interaction.response.send_message(embed=discord.Embed(title="🧹 Reset", description="Database cleared.", color=discord.Color.red()))
 
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def sync(ctx):
     await bot.tree.sync()
-    await ctx.send("✅ Slash commands forced sync. Please wait a minute for changes to appear.")
+    await ctx.send("✅ Sync complete.")
 
 bot.run(DISCORD_TOKEN)
